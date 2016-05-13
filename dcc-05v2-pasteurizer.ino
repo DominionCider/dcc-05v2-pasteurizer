@@ -22,33 +22,38 @@
 #define SW2_LEFT_PIN 0
 #define SW3_RIGHT_PIN 15
 
-#define N_SENSORS 3
-#define COMPRESSOR 0
-#define EVAPORATOR 1
-#define AMBIANT 2
-byte sensorAddr[N_SENSORS][8] = {
+#define N_SENSORS 6
+#define WATER_TEMP_SENSOR 5
+#define BOTTLE_TEMP_SENSOR_MIN 2
+#define BOTTLE_TEMP_SENSOR_MAX 4
+byte sensorAddr[][8] = {
   {0x28, 0xAA, 0x50, 0x80, 0x06, 0x00, 0x00, 0x10}, // (board)
+  {0x28, 0xB7, 0xD2, 0x80, 0x06, 0x00, 0x00, 0x49}, // (power box)
   {0x28, 0xFF, 0xF0, 0xD2, 0xA1, 0x15, 0x04, 0xC7}, // (in-bottle-11)
   {0x28, 0xFF, 0x01, 0xD3, 0xA1, 0x15, 0x04, 0x23}, // (in-bottle-12)
+  {0x28, 0xFF, 0x85, 0x8F, 0xA1, 0x15, 0x04, 0x3D}, // (in-bottle-13)
+  {0x28, 0xFF, 0x32, 0x8F, 0xA1, 0x15, 0x04, 0x23}, // (thermowell)
 };
-char * sensorNames[N_SENSORS] = {
+char * sensorNames[] = {
   "board",
+  "powerbox",
   "in-bottle-1",
+  "in-bottle-2",
+  "in-bottle-3",
+  "thermowell",
 };
 
+#define SENSOR_FREQ 1000
+#define UPLOAD_FREQ 10000
 
-// The minimum time after shutting off the compressor
-// before it is allowed to be turned on again (ms)
-#define MIN_RESTART_TIME 300000
 
-#define SETTINGS_VERSION "8G22"
+#define SETTINGS_VERSION "8a2x"
 struct Settings {
-  float lowPoint;
-  float highPoint;
-  float lowComp;
-  float highComp;
+  float lowPoint;       // Waterbath thermostat ON point
+  float highPoint;      // Waterbath thermostat OFF point
+  float pastUnitLimit;  // PU at which buzzer sounds
 } settings = {
-  10., 11., 55., 50.
+  65.0, 65.2, 30.
 };
 
 
@@ -56,6 +61,7 @@ struct Settings {
 #include "libdcc/onewire.h"
 #include "libdcc/settings.h"
 #include "libdcc/influx.h"
+#include "display.h"
 
 
 // Flag to indicate that a settings report should be sent to InfluxDB
@@ -68,8 +74,7 @@ String formatSettings() {
   return \
     String("lowPoint=") + String(settings.lowPoint, 3) + \
     String(",highPoint=") + String(settings.highPoint, 3) + \
-    String(",lowComp=") + String(settings.lowComp, 3) + \
-    String(",highComp=") + String(settings.highComp, 3);
+    String(",pastUnitLimit=") + String(settings.pastUnitLimit, 3);
 }
 
 void handleSettings() {
@@ -80,10 +85,8 @@ void handleSettings() {
       settings.lowPoint = server.arg(i).toFloat();
     } else if (server.argName(i).equals("highPoint")) {
       settings.highPoint = server.arg(i).toFloat();
-    } else if (server.argName(i).equals("lowComp")) {
-      settings.lowComp = server.arg(i).toFloat();
-    } else if (server.argName(i).equals("highComp")) {
-      settings.highComp = server.arg(i).toFloat();
+    } else if (server.argName(i).equals("pastUnitLimit")) {
+      settings.pastUnitLimit = server.arg(i).toFloat();
     } else {
       Serial.println("Unknown argument: " + server.argName(i) + ": " + server.arg(i));
     }
@@ -109,7 +112,7 @@ LiquidCrystal_I2C lcd(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
 
 volatile unsigned long leftKeyDownTime = 0;
 volatile boolean leftKeyPressed = false;
-void leftKeyChange() {
+ICACHE_FLASH_ATTR void leftKeyChange() {
   noInterrupts();
   delayMicroseconds(15000);
   if (!digitalRead(SW2_LEFT_PIN)) {
@@ -133,7 +136,7 @@ void leftKeyChange() {
 
 volatile unsigned long rightKeyDownTime = 0;
 volatile boolean rightKeyPressed = false;
-void rightKeyChange() {
+ICACHE_FLASH_ATTR void rightKeyChange() {
   noInterrupts();
   delayMicroseconds(15000);
   if (digitalRead(SW3_RIGHT_PIN)) {
@@ -154,6 +157,9 @@ void rightKeyChange() {
   }
   interrupts();
 }
+
+unsigned long lastSensorIteration;
+unsigned long lastUploadIteration;
 
 void setup() {
   pinMode(RED_LED_PIN, OUTPUT);
@@ -193,20 +199,30 @@ void setup() {
   Wire.begin(4, 5); // SDA=4, SCL=5
   lcd.begin(16, 2);
   lcd.backlight();
+  loadCustomChars(lcd);
 
   lcd.home();
   lcd.print("    Dominion");
   lcd.setCursor(0, 1);
-  lcd.print ("    Cider Co.");
+  lcd.print("    Cider Co.");
   delay(2000);
 
   lcd.setCursor(0, 1);
-  lcd.print ("Pasteurizer v1.0");
+  lcd.print("Pasteurizer v1.0");
   delay(2000);
+  lcd.clear();
+
+  // Initialize zeroth iteration
+  takeAllMeasurementsAsync();
+  lastSensorIteration = millis();
+  // Offset upload events from sensor events
+  lastUploadIteration = millis() + SENSOR_FREQ / 2;
 }
 
 
-unsigned long lastIteration;
+float pU;
+bool running = false;
+
 void loop() {
   server.handleClient();
 
@@ -232,22 +248,101 @@ void loop() {
     leftKeyPressed = false;
   }
   if (rightKeyPressed) {
-    digitalWrite(RED_LED_PIN, !digitalRead(RED_LED_PIN));
+    if (running) {
+      running = false;
+    } else {
+      running = true;
+      pU = 0;
+    }
     rightKeyPressed = false;
   }
 
-  if (millis() < lastIteration + 10000) return;
-  lastIteration = millis();
 
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Connecting to wifi...");
+  // If we are ready to do an upload iteration, do that now
+  if (millis() > lastUploadIteration + UPLOAD_FREQ) {
+    // FIXME: Upload to Influx
+    lastUploadIteration = millis();
     return;
   }
-  Serial.println("Wifi connected to " + WiFi.SSID() + " IP:" + WiFi.localIP().toString());
 
-  lcd.clear();
-  lcd.print(WiFi.SSID());
-  lcd.setCursor(0, 1 );
-  lcd.print(WiFi.localIP().toString());
+  // If we are NOT ready to do a sensor iteraction, return early
+  if (millis() < lastSensorIteration + SENSOR_FREQ) {
+    return;
+  }
 
+  // Read sensors
+  float temp[N_SENSORS];
+  float accum = 0.0;
+  float numAccum = 0;
+  String sensorBody = String(DEVICE_NAME) + " uptime=" + String(millis()) + "i";
+  for (int i=0; i<N_SENSORS; i++) {
+    Serial.print("Temperature sensor ");
+    Serial.print(i);
+    Serial.print(": ");
+    if (readTemperature(sensorAddr[i], &temp[i])) {
+      Serial.print(temp[i]);
+      Serial.println();
+      if (i >= BOTTLE_TEMP_SENSOR_MIN && i <= BOTTLE_TEMP_SENSOR_MAX) {
+        accum += temp[i];
+        numAccum++;
+      }
+      sensorBody += String(",") + sensorNames[i] + "=" + String(temp[i], 3);
+    } else {
+      temp[i] = NAN;
+    }
+  }
+  Serial.println(sensorBody);
+
+  // Instruct sensors to take measurements for next iteration
+  takeAllMeasurementsAsync();
+
+  // Do calculations
+  float bottleTemp = NAN;
+  if (numAccum > 0) {
+    bottleTemp = accum / numAccum;
+  } else {
+    running = false;
+  }
+
+  if (running) {
+    pU += computePu(bottleTemp, millis() - lastSensorIteration);
+  }
+  lastSensorIteration = millis();
+
+  // Regulate water temperature
+  if (relayState && temp[WATER_TEMP_SENSOR] > settings.highPoint) {
+    relayState = LOW;
+  } else if (!relayState && temp[WATER_TEMP_SENSOR] < settings.lowPoint) {
+    relayState = HIGH;
+  }
+  digitalWrite(RELAY_PIN, relayState);
+
+  // Update LEDs
+  digitalWrite(RED_LED_PIN, running);
+
+  // Update Display
+  lcd.setCursor(0, 0);
+  lcd.print("Wtr: " + String(temp[WATER_TEMP_SENSOR], 1) + char(3) + "C");
+  lcd.setCursor(0, 1);
+  lcd.print("Btl: " + String(bottleTemp, 1) + char(3) + "C");
+  lcd.setCursor(13, 1);
+  lcd.print(String(int(pU)) + char(2));
+
+  if (WiFi.status() == WL_CONNECTED) {
+    lcd.setCursor(15, 0);
+    lcd.print(char(0));
+  } else {
+    lcd.setCursor(15, 0);
+    lcd.print(char(1));
+  }
+
+}
+
+// As per https://sizes.com/units/pasteurization_unit.htm
+double computePu(float temp, float ms) {
+  if (temp < 60.0) {
+    return 0;
+  }
+
+  return pow(1.393, temp - 60.0) * ms / 60000.0;
 }
