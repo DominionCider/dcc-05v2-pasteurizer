@@ -1,6 +1,7 @@
 #include <ESP8266WiFi.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <math.h>
 
 // Define these in the config.h file
 //#define WIFI_SSID "yourwifi"
@@ -24,6 +25,7 @@
 
 #define N_SENSORS 6
 #define WATER_TEMP_SENSOR 5
+#define POWER_BOX_SENSOR 1
 #define BOTTLE_TEMP_SENSOR_MIN 2
 #define BOTTLE_TEMP_SENSOR_MAX 4
 byte sensorAddr[][8] = {
@@ -47,13 +49,14 @@ char * sensorNames[] = {
 #define UPLOAD_FREQ 10000
 
 
-#define SETTINGS_VERSION "8a2x"
+#define SETTINGS_VERSION "8r25"
 struct Settings {
   float lowPoint;       // Waterbath thermostat ON point
   float highPoint;      // Waterbath thermostat OFF point
-  float pastUnitLimit;  // PU at which buzzer sounds
+  float powerBoxOverheat; // Max temperature of the power box
+  float puLimit;        // PU at which buzzer sounds
 } settings = {
-  65.0, 65.2, 30.
+  65.0, 65.2, 35.0, 30.
 };
 
 
@@ -74,7 +77,8 @@ String formatSettings() {
   return \
     String("lowPoint=") + String(settings.lowPoint, 3) + \
     String(",highPoint=") + String(settings.highPoint, 3) + \
-    String(",pastUnitLimit=") + String(settings.pastUnitLimit, 3);
+    String(",powerBoxOverheat=") + String(settings.powerBoxOverheat, 3) + \
+    String(",puLimit=") + String(settings.puLimit, 3);
 }
 
 void handleSettings() {
@@ -85,8 +89,10 @@ void handleSettings() {
       settings.lowPoint = server.arg(i).toFloat();
     } else if (server.argName(i).equals("highPoint")) {
       settings.highPoint = server.arg(i).toFloat();
-    } else if (server.argName(i).equals("pastUnitLimit")) {
-      settings.pastUnitLimit = server.arg(i).toFloat();
+    } else if (server.argName(i).equals("powerBoxOverheat")) {
+      settings.powerBoxOverheat = server.arg(i).toFloat();
+    } else if (server.argName(i).equals("puLimit")) {
+      settings.puLimit = server.arg(i).toFloat();
     } else {
       Serial.println("Unknown argument: " + server.argName(i) + ": " + server.arg(i));
     }
@@ -110,8 +116,10 @@ LiquidCrystal_I2C lcd(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
 // Long push duration
 #define KEY_PRESS_LONG 1000
 
+volatile float pU;
+volatile bool alarmArmed = true;
+
 volatile unsigned long leftKeyDownTime = 0;
-volatile boolean leftKeyPressed = false;
 ICACHE_FLASH_ATTR void leftKeyChange() {
   noInterrupts();
   delayMicroseconds(15000);
@@ -126,7 +134,10 @@ ICACHE_FLASH_ATTR void leftKeyChange() {
 
     if (millis() - leftKeyDownTime > KEY_PRESS_DURATION) {
       // Register key press
-      leftKeyPressed = true;
+      pU = 0;
+      alarmArmed = true;
+      digitalWrite(RED_LED_PIN, LOW);
+      digitalWrite(BUZZER_PIN, LOW);
     }
 
     leftKeyDownTime = 0;
@@ -135,7 +146,6 @@ ICACHE_FLASH_ATTR void leftKeyChange() {
 }
 
 volatile unsigned long rightKeyDownTime = 0;
-volatile boolean rightKeyPressed = false;
 ICACHE_FLASH_ATTR void rightKeyChange() {
   noInterrupts();
   delayMicroseconds(15000);
@@ -150,7 +160,9 @@ ICACHE_FLASH_ATTR void rightKeyChange() {
 
     if (millis() - rightKeyDownTime > KEY_PRESS_DURATION) {
       // Register key press
-      rightKeyPressed = true;
+      alarmArmed = false;
+      digitalWrite(GREEN_LED_PIN, LOW);
+      digitalWrite(BUZZER_PIN, LOW);
     }
 
     rightKeyDownTime = 0;
@@ -219,50 +231,19 @@ void setup() {
   lastUploadIteration = millis() + SENSOR_FREQ / 2;
 }
 
-
-float pU;
-bool running = false;
+WiFiClient client;
 
 void loop() {
   server.handleClient();
 
-  /*
-  if (!leftKeyPressed && leftKeyDownTime && (millis() - leftKeyDownTime > KEY_PRESS_LONG)) {
-    leftKeyDownTime = 0;
-    digitalWrite(GREEN_LED_PIN, !digitalRead(GREEN_LED_PIN));
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(100);
-    digitalWrite(BUZZER_PIN, LOW);
-  }
-  if (!rightKeyPressed && rightKeyDownTime && (millis() - rightKeyDownTime > KEY_PRESS_LONG)) {
-    rightKeyDownTime = 0;
-    digitalWrite(RED_LED_PIN, !digitalRead(RED_LED_PIN));
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(100);
-    digitalWrite(BUZZER_PIN, LOW);
-  }
-  */
+  // Update LEDs & buzzer
+  digitalWrite(RED_LED_PIN, pU > settings.puLimit);
+  digitalWrite(GREEN_LED_PIN, alarmArmed);
+  digitalWrite(BUZZER_PIN, (alarmArmed && pU > settings.puLimit));
 
-  if (leftKeyPressed) {
-    digitalWrite(GREEN_LED_PIN, !digitalRead(GREEN_LED_PIN));
-    leftKeyPressed = false;
-  }
-  if (rightKeyPressed) {
-    if (running) {
-      running = false;
-    } else {
-      running = true;
-      pU = 0;
-    }
-    rightKeyPressed = false;
-  }
-
-
-  // If we are ready to do an upload iteration, do that now
-  if (millis() > lastUploadIteration + UPLOAD_FREQ) {
-    // FIXME: Upload to Influx
-    lastUploadIteration = millis();
-    return;
+  // Copy HTTP client response to Serial
+  while (client.connected() && client.available()) {
+    Serial.print(client.readStringUntil('\r'));
   }
 
   // If we are NOT ready to do a sensor iteraction, return early
@@ -300,33 +281,33 @@ void loop() {
   float bottleTemp = NAN;
   if (numAccum > 0) {
     bottleTemp = accum / numAccum;
+    sensorBody += String(",bottleTemp=") + String(bottleTemp, 3);
   } else {
-    running = false;
+    // ERROR
   }
 
-  if (running) {
-    pU += computePu(bottleTemp, millis() - lastSensorIteration);
+  pU += computePu(bottleTemp, millis() - lastSensorIteration);
+  if (!isnan(pU)) {
+    sensorBody += String(",pU=") + String(pU, 2);
   }
   lastSensorIteration = millis();
 
   // Regulate water temperature
-  if (relayState && temp[WATER_TEMP_SENSOR] > settings.highPoint) {
+  if (relayState && (temp[WATER_TEMP_SENSOR] > settings.highPoint || temp[POWER_BOX_SENSOR] > settings.powerBoxOverheat)) {
     relayState = LOW;
-  } else if (!relayState && temp[WATER_TEMP_SENSOR] < settings.lowPoint) {
+  } else if (!relayState && temp[WATER_TEMP_SENSOR] < settings.lowPoint && temp[POWER_BOX_SENSOR] < settings.powerBoxOverheat) {
     relayState = HIGH;
   }
   digitalWrite(RELAY_PIN, relayState);
-
-  // Update LEDs
-  digitalWrite(RED_LED_PIN, running);
+  sensorBody += String(",relayState=") + String(relayState) + "i";
 
   // Update Display
   lcd.setCursor(0, 0);
-  lcd.print("Wtr: " + String(temp[WATER_TEMP_SENSOR], 1) + char(3) + "C");
+  lcd.print("Wtr: " + leftPad(String(temp[WATER_TEMP_SENSOR], 1), 4) + char(3) + "C");
   lcd.setCursor(0, 1);
-  lcd.print("Btl: " + String(bottleTemp, 1) + char(3) + "C");
+  lcd.print("Btl: " + leftPad(String(bottleTemp, 1), 4) + char(3) + "C");
   lcd.setCursor(13, 1);
-  lcd.print(String(int(pU)) + char(2));
+  lcd.print(leftPad(String(int(pU)), 2) + char(2));
 
   if (WiFi.status() == WL_CONNECTED) {
     lcd.setCursor(15, 0);
@@ -335,6 +316,16 @@ void loop() {
     lcd.setCursor(15, 0);
     lcd.print(char(1));
   }
+
+  // If we are ready to do an upload iteration, do that now
+  if (millis() > lastUploadIteration + UPLOAD_FREQ) {
+    Serial.println("Wifi connected to " + WiFi.SSID() + " IP:" + WiFi.localIP().toString());
+    client.connect(INFLUX_HOSTNAME, INFLUX_PORT);
+    postRequestAsync(sensorBody, client);
+    lastUploadIteration = millis();
+  }
+
+
 
 }
 
@@ -345,4 +336,20 @@ double computePu(float temp, float ms) {
   }
 
   return pow(1.393, temp - 60.0) * ms / 60000.0;
+}
+
+String leftPad(String s, int len) {
+  int inLen = s.length();
+  String out;
+  out.reserve(len);
+  if (inLen > len) {
+    for (int i=0; i<len; i++) {
+      out += "#";
+    }
+    return out;
+  }
+  for (int i=0; i<len-inLen; i++) {
+    out += " ";
+  }
+  return out + s;
 }
