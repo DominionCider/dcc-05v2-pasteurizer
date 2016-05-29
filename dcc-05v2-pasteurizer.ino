@@ -73,6 +73,8 @@ bool doPostSettings = false;
 
 bool relayState = LOW;
 
+bool errorState = false;
+
 String formatSettings() {
   return \
     String("lowPoint=") + String(settings.lowPoint, 3) + \
@@ -118,6 +120,7 @@ LiquidCrystal_I2C lcd(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
 
 volatile float pU;
 volatile bool alarmArmed = true;
+float lastRealBottleTemp = NAN;
 
 volatile unsigned long leftKeyDownTime = 0;
 ICACHE_FLASH_ATTR void leftKeyChange() {
@@ -229,6 +232,9 @@ void setup() {
   lastSensorIteration = millis();
   // Offset upload events from sensor events
   lastUploadIteration = millis() + SENSOR_FREQ / 2;
+
+  // Abuse PWM to blink for error conditions
+  analogWriteFreq(2); // 2 Hz
 }
 
 WiFiClient client;
@@ -250,6 +256,9 @@ void loop() {
   if (millis() < lastSensorIteration + SENSOR_FREQ) {
     return;
   }
+
+  // Error state, computed per-reading
+  bool errorReadingSensor = false;
 
   // Read sensors
   float temp[N_SENSORS];
@@ -279,17 +288,25 @@ void loop() {
 
   // Do calculations
   float bottleTemp = NAN;
+
   if (numAccum > 0) {
     bottleTemp = accum / numAccum;
     sensorBody += String(",bottleTemp=") + String(bottleTemp, 3);
+    lastRealBottleTemp = bottleTemp; // Keep this around so that we can keep accumulating an estimation of PU during an error state
   } else {
     // ERROR
+    errorReadingSensor = true;
   }
 
-  pU += computePu(bottleTemp, millis() - lastSensorIteration);
-  if (!isnan(pU)) {
-    sensorBody += String(",pU=") + String(pU, 2);
+  // Always accumulate PU with the last known real bottle temperature, so that we can continue calculating PU in an error state.
+  // In the case that there was an error on the first temperature reading, we'll skip accumulating PU.
+  if (!isnan(lastRealBottleTemp)) {
+    pU += computePu(lastRealBottleTemp, millis() - lastSensorIteration);
+    if (!isnan(pU)) {
+      sensorBody += String(",pU=") + String(pU, 2);
+    }
   }
+  
   lastSensorIteration = millis();
 
   // Regulate water temperature
@@ -325,8 +342,16 @@ void loop() {
     lastUploadIteration = millis();
   }
 
-
-
+  // If we've encountered an error during this run, put the system into error state - otherwise, clear error state
+  // If we're already in error state and continue encountering errors, do nothing
+  if (errorReadingSensor && !errorState) {
+    errorState = true;
+    analogWrite(RED_LED_PIN, PWMRANGE / 2);
+  }
+  else if (errorState && !errorReadingSensor){
+    errorState = false;
+    analogWrite(RED_LED_PIN, 0);
+  }
 }
 
 // As per https://sizes.com/units/pasteurization_unit.htm
