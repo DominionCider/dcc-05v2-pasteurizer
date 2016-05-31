@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <math.h>
+#include <Ticker.h>
 
 // Define these in the config.h file
 //#define WIFI_SSID "yourwifi"
@@ -73,8 +74,6 @@ bool doPostSettings = false;
 
 bool relayState = LOW;
 
-bool errorState = false;
-
 String formatSettings() {
   return \
     String("lowPoint=") + String(settings.lowPoint, 3) + \
@@ -109,6 +108,8 @@ void handleSettings() {
   doPostSettings = true;
 }
 
+Ticker blinkLed;
+
 // As per https://arduino-info.wikispaces.com/LCD-Blue-I2C#v1
 LiquidCrystal_I2C lcd(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
 
@@ -121,6 +122,8 @@ LiquidCrystal_I2C lcd(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
 volatile float pU;
 volatile bool alarmArmed = true;
 float lastRealBottleTemp = NAN;
+volatile bool errorState = false;
+
 
 volatile unsigned long leftKeyDownTime = 0;
 ICACHE_FLASH_ATTR void leftKeyChange() {
@@ -173,6 +176,12 @@ ICACHE_FLASH_ATTR void rightKeyChange() {
   interrupts();
 }
 
+ICACHE_FLASH_ATTR void blinkOnError(void) {
+  if (errorState) {
+    digitalWrite(RED_LED_PIN, !digitalRead(RED_LED_PIN));
+  }
+}
+
 unsigned long lastSensorIteration;
 unsigned long lastUploadIteration;
 
@@ -198,6 +207,8 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(SW3_RIGHT_PIN), rightKeyChange, CHANGE);
 
   Serial.begin(115200);
+
+  blinkLed.attach(0.3, blinkOnError);
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -232,9 +243,6 @@ void setup() {
   lastSensorIteration = millis();
   // Offset upload events from sensor events
   lastUploadIteration = millis() + SENSOR_FREQ / 2;
-
-  // Abuse PWM to blink for error conditions
-  analogWriteFreq(2); // 2 Hz
 }
 
 WiFiClient client;
@@ -243,7 +251,9 @@ void loop() {
   server.handleClient();
 
   // Update LEDs & buzzer
-  digitalWrite(RED_LED_PIN, pU > settings.puLimit);
+  if (!errorState) {
+    digitalWrite(RED_LED_PIN, pU > settings.puLimit);
+  }
   digitalWrite(GREEN_LED_PIN, alarmArmed);
   digitalWrite(BUZZER_PIN, (alarmArmed && pU > settings.puLimit));
 
@@ -256,9 +266,6 @@ void loop() {
   if (millis() < lastSensorIteration + SENSOR_FREQ) {
     return;
   }
-
-  // Error state, computed per-reading
-  bool errorReadingSensor = false;
 
   // Read sensors
   float temp[N_SENSORS];
@@ -293,9 +300,9 @@ void loop() {
     bottleTemp = accum / numAccum;
     sensorBody += String(",bottleTemp=") + String(bottleTemp, 3);
     lastRealBottleTemp = bottleTemp; // Keep this around so that we can keep accumulating an estimation of PU during an error state
+    errorState = false;
   } else {
-    // ERROR
-    errorReadingSensor = true;
+    errorState = true;
   }
 
   // Always accumulate PU with the last known real bottle temperature, so that we can continue calculating PU in an error state.
@@ -306,7 +313,7 @@ void loop() {
       sensorBody += String(",pU=") + String(pU, 2);
     }
   }
-  
+
   lastSensorIteration = millis();
 
   // Regulate water temperature
@@ -340,17 +347,6 @@ void loop() {
     client.connect(INFLUX_HOSTNAME, INFLUX_PORT);
     postRequestAsync(sensorBody, client);
     lastUploadIteration = millis();
-  }
-
-  // If we've encountered an error during this run, put the system into error state - otherwise, clear error state
-  // If we're already in error state and continue encountering errors, do nothing
-  if (errorReadingSensor && !errorState) {
-    errorState = true;
-    analogWrite(RED_LED_PIN, PWMRANGE / 2);
-  }
-  else if (errorState && !errorReadingSensor){
-    errorState = false;
-    analogWrite(RED_LED_PIN, 0);
   }
 }
 
